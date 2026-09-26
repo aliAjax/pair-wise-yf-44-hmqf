@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timezone
 
 from .domain import (
     ConflictError,
@@ -41,18 +41,110 @@ def _validate_commission(actor, entity, data, lookup):
     return {"commissioned_by": actor.user_id}
 
 
-CUSTOM_CREATE = {'change': _validate_change}
-CUSTOM_TRANSITIONS = {('change', 'assess'): _validate_assess, ('change', 'approve'): _validate_approve, ('change', 'commission'): _validate_commission}
+def parse_instant(value):
+    text = str(value).strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        moment = datetime.fromisoformat(text)
+    except ValueError:
+        raise ValidationError("invalid datetime: " + str(value))
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment
+
+
+def windows_overlap(a_start, a_end, b_start, b_end):
+    return parse_instant(a_start) < parse_instant(b_end) and parse_instant(b_start) < parse_instant(a_end)
+
+
+def is_overdue(entity, now=None):
+    if entity.get("status") != "active":
+        return False
+    end = entity.get("data", {}).get("work_end")
+    if not end:
+        return False
+    now = now or datetime.now(timezone.utc)
+    return parse_instant(end) < now
+
+
+def temp_change_conflicts(entity, others):
+    data = entity.get("data", {})
+    hits = []
+    for other in others or []:
+        if other.get("id") == entity.get("id") or other.get("status") != "active":
+            continue
+        other_data = other.get("data", {})
+        if other_data.get("unit_id") != data.get("unit_id"):
+            continue
+        if windows_overlap(
+            data.get("work_start"), data.get("work_end"),
+            other_data.get("work_start"), other_data.get("work_end"),
+        ):
+            hits.append(other["id"])
+    return sorted(hits)
+
+
+def startup_blockers(unit_id, temp_changes, now=None):
+    now = now or datetime.now(timezone.utc)
+    return sorted(
+        item["id"]
+        for item in temp_changes or []
+        if item.get("data", {}).get("unit_id") == unit_id and is_overdue(item, now)
+    )
+
+
+def _validate_temp_change(actor, data, lookup):
+    unit = _find_one(lookup, "unit", "id", data.get("unit_id"))
+    if not unit:
+        raise ValidationError("unit does not exist")
+    if not data.get("description", "").strip():
+        raise ValidationError("work description is required")
+    start = parse_instant(data.get("work_start"))
+    end = parse_instant(data.get("work_end"))
+    if end <= start:
+        raise ValidationError("work_end must be later than work_start")
+
+
+def _validate_tc_confirm(actor, entity, data, lookup):
+    others = lookup("temp_change", "unit_id", entity["data"].get("unit_id")) if lookup else []
+    hits = temp_change_conflicts(entity, others)
+    if hits:
+        raise ValidationError("window conflicts with active temp change(s): " + ", ".join(hits))
+    return {"confirmed_by": actor.user_id}
+
+
+def _validate_tc_renew(actor, entity, data, lookup):
+    old_end = parse_instant(entity["data"].get("work_end"))
+    new_end = parse_instant(data.get("work_end"))
+    if new_end <= old_end:
+        raise ValidationError("new work_end must be later than current work_end")
+    return {
+        "revision": int(entity["data"].get("revision", 1)) + 1,
+        "risk_level": data.get("risk_level"),
+        "risk_note": data.get("risk_note"),
+    }
+
+
+def _validate_unit_startup(actor, entity, data, lookup):
+    changes = lookup("temp_change", "unit_id", entity["id"]) if lookup else []
+    blocked = startup_blockers(entity["id"], changes)
+    if blocked:
+        raise ValidationError("overdue unrestored temp change(s) block startup: " + ", ".join(blocked))
+
+
+CUSTOM_CREATE = {'change': _validate_change, 'temp_change': _validate_temp_change}
+CUSTOM_TRANSITIONS = {('change', 'assess'): _validate_assess, ('change', 'approve'): _validate_approve, ('change', 'commission'): _validate_commission, ('temp_change', 'confirm'): _validate_tc_confirm, ('temp_change', 'renew'): _validate_tc_renew, ('unit', 'startup'): _validate_unit_startup}
 
 
 class RuleEngine:
-    ALIASES = {'units': 'unit', 'changes': 'change', 'action_items': 'action_item'}
-    INITIAL_STATUS = {'unit': 'operating', 'change': 'draft', 'action_item': 'open'}
-    TRANSITIONS = {'unit': {'shutdown': (('operating',), 'shutdown'), 'startup': (('shutdown',), 'operating'), 'freeze': (('operating',), 'frozen'), 'unfreeze': (('frozen',), 'operating')}, 'change': {'assess': (('draft',), 'assessed'), 'approve': (('assessed',), 'approved'), 'implement': (('approved',), 'implemented'), 'commission': (('implemented',), 'commissioned'), 'rollback': (('implemented', 'commissioned'), 'rolled_back'), 'close': (('rolled_back',), 'closed')}, 'action_item': {'complete': (('open',), 'completed'), 'verify': (('completed',), 'verified'), 'reopen': (('verified',), 'open')}}
-    CREATE_REQUIRED = {'unit': ('name', 'location'), 'change': ('unit_id', 'description'), 'action_item': ('change_id', 'description', 'owner')}
-    ACTION_REQUIRED = {('unit', 'shutdown'): ('reason',), ('unit', 'freeze'): ('reason',), ('change', 'assess'): ('risk_level', 'analyst'), ('change', 'approve'): ('approvals', 'permit_id'), ('change', 'implement'): ('procedure_version',), ('change', 'commission'): ('tests_passed',), ('change', 'rollback'): ('reason',), ('change', 'close'): ('outcome',), ('action_item', 'complete'): ('completed_by', 'evidence'), ('action_item', 'verify'): ('verifier',), ('action_item', 'reopen'): ('reason',)}
-    CREATE_ROLES = {'unit': ('admin', 'engineer'), 'change': ('admin', 'engineer'), 'action_item': ('admin', 'safety')}
-    ROLE_ACTIONS = {'shutdown': ('admin', 'operator'), 'startup': ('admin', 'operator'), 'freeze': ('admin', 'operator'), 'unfreeze': ('admin', 'operator'), 'assess': ('admin', 'engineer'), 'approve': ('admin', 'safety'), 'implement': ('admin', 'engineer'), 'commission': ('admin', 'engineer'), 'rollback': ('admin', 'engineer'), 'close': ('admin', 'safety'), 'complete': ('admin', 'engineer'), 'verify': ('admin', 'verifier'), 'reopen': ('admin', 'verifier')}
+    ALIASES = {'units': 'unit', 'changes': 'change', 'action_items': 'action_item', 'temp_changes': 'temp_change'}
+    INITIAL_STATUS = {'unit': 'operating', 'change': 'draft', 'action_item': 'open', 'temp_change': 'pending'}
+    TRANSITIONS = {'unit': {'shutdown': (('operating',), 'shutdown'), 'startup': (('shutdown',), 'operating'), 'freeze': (('operating',), 'frozen'), 'unfreeze': (('frozen',), 'operating')}, 'change': {'assess': (('draft',), 'assessed'), 'approve': (('assessed',), 'approved'), 'implement': (('approved',), 'implemented'), 'commission': (('implemented',), 'commissioned'), 'rollback': (('implemented', 'commissioned'), 'rolled_back'), 'close': (('rolled_back',), 'closed')}, 'action_item': {'complete': (('open',), 'completed'), 'verify': (('completed',), 'verified'), 'reopen': (('verified',), 'open')}, 'temp_change': {'confirm': (('pending',), 'active'), 'restore': (('active',), 'restored'), 'renew': (('active',), 'pending'), 'reject': (('pending',), 'rejected')}}
+    CREATE_REQUIRED = {'unit': ('name', 'location'), 'change': ('unit_id', 'description'), 'action_item': ('change_id', 'description', 'owner'), 'temp_change': ('unit_id', 'description', 'work_start', 'work_end', 'isolation', 'restore_owner')}
+    ACTION_REQUIRED = {('unit', 'shutdown'): ('reason',), ('unit', 'freeze'): ('reason',), ('change', 'assess'): ('risk_level', 'analyst'), ('change', 'approve'): ('approvals', 'permit_id'), ('change', 'implement'): ('procedure_version',), ('change', 'commission'): ('tests_passed',), ('change', 'rollback'): ('reason',), ('change', 'close'): ('outcome',), ('action_item', 'complete'): ('completed_by', 'evidence'), ('action_item', 'verify'): ('verifier',), ('action_item', 'reopen'): ('reason',), ('temp_change', 'restore'): ('restored_by', 'restore_note'), ('temp_change', 'renew'): ('work_end', 'risk_level', 'risk_note'), ('temp_change', 'reject'): ('reason',)}
+    CREATE_ROLES = {'unit': ('admin', 'engineer'), 'change': ('admin', 'engineer'), 'action_item': ('admin', 'safety'), 'temp_change': ('admin', 'engineer', 'operator')}
+    ROLE_ACTIONS = {'shutdown': ('admin', 'operator'), 'startup': ('admin', 'operator'), 'freeze': ('admin', 'operator'), 'unfreeze': ('admin', 'operator'), 'assess': ('admin', 'engineer'), 'approve': ('admin', 'safety'), 'implement': ('admin', 'engineer'), 'commission': ('admin', 'engineer'), 'rollback': ('admin', 'engineer'), 'close': ('admin', 'safety'), 'complete': ('admin', 'engineer'), 'verify': ('admin', 'verifier'), 'reopen': ('admin', 'verifier'), 'confirm': ('admin', 'safety'), 'restore': ('admin', 'operator', 'engineer'), 'renew': ('admin', 'engineer', 'operator'), 'reject': ('admin', 'safety')}
 
     def normalize_kind(self, kind):
         return self.ALIASES.get(kind, kind)

@@ -1,8 +1,9 @@
+from datetime import datetime, timezone
 from uuid import uuid4
 
 from .audit import AuditTrail
 from .domain import ConflictError, NotFoundError
-from .rules import RuleEngine
+from .rules import RuleEngine, is_overdue, startup_blockers, temp_change_conflicts
 
 
 class DomainService:
@@ -68,6 +69,34 @@ class DomainService:
         if kind:
             kind = self.rules.normalize_kind(kind)
         return self.repository.list_entities(kind=kind, status=status)
+
+    def board(self):
+        now = datetime.now(timezone.utc)
+        units = self.repository.list_entities(kind="unit")
+        changes = self.repository.list_entities(kind="temp_change")
+        change_views = []
+        for item in changes:
+            view = dict(item)
+            view["overdue"] = is_overdue(item, now)
+            view["conflicts"] = (
+                temp_change_conflicts(item, changes) if item["status"] == "pending" else []
+            )
+            change_views.append(view)
+        unit_views = []
+        for unit in units:
+            view = dict(unit)
+            view["startup_blockers"] = startup_blockers(unit["id"], changes, now)
+            view["active_temp_changes"] = sorted(
+                item["id"]
+                for item in changes
+                if item["status"] == "active" and item["data"].get("unit_id") == unit["id"]
+            )
+            unit_views.append(view)
+        return {
+            "now": now.isoformat(timespec="seconds"),
+            "units": unit_views,
+            "temp_changes": change_views,
+        }
 
     def audit_log(self, entity_id=None):
         return self.repository.list_audit(entity_id=entity_id)
