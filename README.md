@@ -25,6 +25,15 @@ python3 app.py --db ./data.db --port 8310
 ## 核心对象
 
 - `unit`：装置运行状态；`change`：变更申请；`action_item`：风险控制行动项。
+- `temp_change`：临时变更（夜间抢修协调）。登记受影响装置、作业时段（`window_start`/`window_end`）、隔离措施（`isolation`）和恢复负责人（`restore_owner`）。
+
+## 临时变更流程
+
+1. 登记后为`draft`，`submit`后进入`submitted`。
+2. 安全员（safety）执行`confirm`才生效（`active`）；若作业时段与该装置已生效单据重叠，确认被退回并指出冲突单号。
+3. `restore`（需`restored_by`）完成恢复，进入`restored`。
+4. 生效中未到期的单据可`renew`：需重新填写时段和风险评估（`risk_level`、`analyst`），生成新的确认版本（`revision`+1）并回到`submitted`，须安全员再次确认。已到期未恢复的单据不能续期，须重新登记。
+5. 装置存在到期未恢复的临时变更时，`startup`被拒绝并列出阻塞单号；`GET /api/units/<id>/blockers`返回该装置的阻塞单明细和`can_startup`。
 
 ## 主要接口
 
@@ -33,6 +42,7 @@ python3 app.py --db ./data.db --port 8310
 - `POST /api/<kind>`：创建对象；请求体为JSON。
 - `GET /api/entities/<id>`：读取对象当前版本。
 - `POST /api/entities/<id>/actions`：提交`{"action":"动作名","data":{...},"expected_version":数字}`。
+- `GET /api/units/<id>/blockers`：查询装置到期未恢复的临时变更阻塞项。
 - `GET /api/audit`：读取审计记录。
 
 请求身份通过`X-User-Id`和`X-Role`请求头传入。创建和动作的可执行角色由规则引擎控制。

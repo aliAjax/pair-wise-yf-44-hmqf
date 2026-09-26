@@ -2,7 +2,7 @@ from uuid import uuid4
 
 from .audit import AuditTrail
 from .domain import ConflictError, NotFoundError
-from .rules import RuleEngine
+from .rules import RuleEngine, find_unit_blockers
 
 
 class DomainService:
@@ -63,6 +63,18 @@ class DomainService:
         if not entity:
             raise NotFoundError("entity not found: " + entity_id)
         return entity
+
+    def unit_blockers(self, unit_id):
+        unit = self.repository.get_entity(unit_id)
+        if not unit or unit["kind"] != "unit":
+            raise NotFoundError("unit not found: " + unit_id)
+        blocker_ids = find_unit_blockers(self._lookup, unit_id)
+        blockers = [self.repository.get_entity(item_id) for item_id in blocker_ids]
+        return {
+            "unit_id": unit_id,
+            "can_startup": not blockers,
+            "blockers": blockers,
+        }
 
     def list(self, kind=None, status=None):
         if kind:

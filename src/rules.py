@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from .domain import (
     ConflictError,
@@ -41,18 +41,119 @@ def _validate_commission(actor, entity, data, lookup):
     return {"commissioned_by": actor.user_id}
 
 
-CUSTOM_CREATE = {'change': _validate_change}
-CUSTOM_TRANSITIONS = {('change', 'assess'): _validate_assess, ('change', 'approve'): _validate_approve, ('change', 'commission'): _validate_commission}
+def _parse_instant(value, field):
+    try:
+        parsed = datetime.fromisoformat(str(value).strip())
+    except (TypeError, ValueError):
+        raise ValidationError("invalid datetime for %s: %s" % (field, value))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _utcnow():
+    return datetime.now(timezone.utc)
+
+
+def _validate_window(data):
+    start = _parse_instant(data.get("window_start"), "window_start")
+    end = _parse_instant(data.get("window_end"), "window_end")
+    if end <= start:
+        raise ValidationError("window_end must be after window_start")
+    return start, end
+
+
+def _validate_temp_change(actor, data, lookup):
+    unit = _find_one(lookup, "unit", "id", data.get("unit_id"))
+    if not unit:
+        raise ValidationError("unit does not exist")
+    _validate_window(data)
+    if not str(data.get("isolation", "")).strip():
+        raise ValidationError("isolation measures are required")
+    if not str(data.get("restore_owner", "")).strip():
+        raise ValidationError("restore owner is required")
+
+
+def find_window_conflicts(lookup, unit_id, start, end, exclude_id=None):
+    """Ids of active temp changes on the unit whose windows overlap [start, end)."""
+    if lookup is None:
+        return []
+    conflicts = []
+    for item in lookup("temp_change", "unit_id", unit_id) or []:
+        if item["id"] == exclude_id or item["status"] != "active":
+            continue
+        other_start, other_end = _validate_window(item["data"])
+        if start < other_end and other_start < end:
+            conflicts.append(item["id"])
+    return sorted(conflicts)
+
+
+def find_unit_blockers(lookup, unit_id, now=None):
+    """Ids of active temp changes on the unit whose window expired without restore."""
+    if lookup is None:
+        return []
+    moment = now or _utcnow()
+    blockers = []
+    for item in lookup("temp_change", "unit_id", unit_id) or []:
+        if item["status"] != "active":
+            continue
+        _, end = _validate_window(item["data"])
+        if moment > end:
+            blockers.append(item["id"])
+    return sorted(blockers)
+
+
+def _validate_temp_confirm(actor, entity, data, lookup):
+    start, end = _validate_window(entity["data"])
+    conflicts = find_window_conflicts(
+        lookup, entity["data"].get("unit_id"), start, end, exclude_id=entity["id"]
+    )
+    if conflicts:
+        raise ConflictError(
+            "作业时段与已生效临时变更冲突，冲突单: " + ", ".join(conflicts)
+        )
+    return {
+        "confirmed_by": actor.user_id,
+        "confirmed_at": _utcnow().isoformat(timespec="seconds"),
+    }
+
+
+def _validate_temp_restore(actor, entity, data, lookup):
+    return {"restored_at": _utcnow().isoformat(timespec="seconds")}
+
+
+def _validate_temp_renew(actor, entity, data, lookup):
+    _, current_end = _validate_window(entity["data"])
+    if _utcnow() > current_end:
+        raise ValidationError("临时变更已到期未恢复，不能直接续期，请重新登记申请")
+    _validate_window(data)
+    return {
+        "revision": int(entity["data"].get("revision", 1)) + 1,
+        "reassessed_by": data.get("analyst"),
+        "previous_window_end": current_end.isoformat(timespec="seconds"),
+    }
+
+
+def _validate_unit_startup(actor, entity, data, lookup):
+    blockers = find_unit_blockers(lookup, entity["id"])
+    if blockers:
+        raise ValidationError(
+            "存在到期未恢复的临时变更，装置不能启动，阻塞单: " + ", ".join(blockers)
+        )
+
+
+CUSTOM_CREATE = {'change': _validate_change, 'temp_change': _validate_temp_change}
+CUSTOM_TRANSITIONS = {('change', 'assess'): _validate_assess, ('change', 'approve'): _validate_approve, ('change', 'commission'): _validate_commission, ('temp_change', 'confirm'): _validate_temp_confirm, ('temp_change', 'restore'): _validate_temp_restore, ('temp_change', 'renew'): _validate_temp_renew, ('unit', 'startup'): _validate_unit_startup}
 
 
 class RuleEngine:
-    ALIASES = {'units': 'unit', 'changes': 'change', 'action_items': 'action_item'}
-    INITIAL_STATUS = {'unit': 'operating', 'change': 'draft', 'action_item': 'open'}
-    TRANSITIONS = {'unit': {'shutdown': (('operating',), 'shutdown'), 'startup': (('shutdown',), 'operating'), 'freeze': (('operating',), 'frozen'), 'unfreeze': (('frozen',), 'operating')}, 'change': {'assess': (('draft',), 'assessed'), 'approve': (('assessed',), 'approved'), 'implement': (('approved',), 'implemented'), 'commission': (('implemented',), 'commissioned'), 'rollback': (('implemented', 'commissioned'), 'rolled_back'), 'close': (('rolled_back',), 'closed')}, 'action_item': {'complete': (('open',), 'completed'), 'verify': (('completed',), 'verified'), 'reopen': (('verified',), 'open')}}
-    CREATE_REQUIRED = {'unit': ('name', 'location'), 'change': ('unit_id', 'description'), 'action_item': ('change_id', 'description', 'owner')}
-    ACTION_REQUIRED = {('unit', 'shutdown'): ('reason',), ('unit', 'freeze'): ('reason',), ('change', 'assess'): ('risk_level', 'analyst'), ('change', 'approve'): ('approvals', 'permit_id'), ('change', 'implement'): ('procedure_version',), ('change', 'commission'): ('tests_passed',), ('change', 'rollback'): ('reason',), ('change', 'close'): ('outcome',), ('action_item', 'complete'): ('completed_by', 'evidence'), ('action_item', 'verify'): ('verifier',), ('action_item', 'reopen'): ('reason',)}
-    CREATE_ROLES = {'unit': ('admin', 'engineer'), 'change': ('admin', 'engineer'), 'action_item': ('admin', 'safety')}
-    ROLE_ACTIONS = {'shutdown': ('admin', 'operator'), 'startup': ('admin', 'operator'), 'freeze': ('admin', 'operator'), 'unfreeze': ('admin', 'operator'), 'assess': ('admin', 'engineer'), 'approve': ('admin', 'safety'), 'implement': ('admin', 'engineer'), 'commission': ('admin', 'engineer'), 'rollback': ('admin', 'engineer'), 'close': ('admin', 'safety'), 'complete': ('admin', 'engineer'), 'verify': ('admin', 'verifier'), 'reopen': ('admin', 'verifier')}
+    ALIASES = {'units': 'unit', 'changes': 'change', 'action_items': 'action_item', 'temp_changes': 'temp_change'}
+    INITIAL_STATUS = {'unit': 'operating', 'change': 'draft', 'action_item': 'open', 'temp_change': 'draft'}
+    TRANSITIONS = {'unit': {'shutdown': (('operating',), 'shutdown'), 'startup': (('shutdown',), 'operating'), 'freeze': (('operating',), 'frozen'), 'unfreeze': (('frozen',), 'operating')}, 'change': {'assess': (('draft',), 'assessed'), 'approve': (('assessed',), 'approved'), 'implement': (('approved',), 'implemented'), 'commission': (('implemented',), 'commissioned'), 'rollback': (('implemented', 'commissioned'), 'rolled_back'), 'close': (('rolled_back',), 'closed')}, 'action_item': {'complete': (('open',), 'completed'), 'verify': (('completed',), 'verified'), 'reopen': (('verified',), 'open')}, 'temp_change': {'submit': (('draft',), 'submitted'), 'confirm': (('submitted',), 'active'), 'restore': (('active',), 'restored'), 'renew': (('active',), 'submitted')}}
+    CREATE_REQUIRED = {'unit': ('name', 'location'), 'change': ('unit_id', 'description'), 'action_item': ('change_id', 'description', 'owner'), 'temp_change': ('unit_id', 'description', 'window_start', 'window_end', 'isolation', 'restore_owner')}
+    ACTION_REQUIRED = {('unit', 'shutdown'): ('reason',), ('unit', 'freeze'): ('reason',), ('change', 'assess'): ('risk_level', 'analyst'), ('change', 'approve'): ('approvals', 'permit_id'), ('change', 'implement'): ('procedure_version',), ('change', 'commission'): ('tests_passed',), ('change', 'rollback'): ('reason',), ('change', 'close'): ('outcome',), ('action_item', 'complete'): ('completed_by', 'evidence'), ('action_item', 'verify'): ('verifier',), ('action_item', 'reopen'): ('reason',), ('temp_change', 'restore'): ('restored_by',), ('temp_change', 'renew'): ('window_start', 'window_end', 'risk_level', 'analyst')}
+    CREATE_ROLES = {'unit': ('admin', 'engineer'), 'change': ('admin', 'engineer'), 'action_item': ('admin', 'safety'), 'temp_change': ('admin', 'engineer', 'operator')}
+    ROLE_ACTIONS = {'shutdown': ('admin', 'operator'), 'startup': ('admin', 'operator'), 'freeze': ('admin', 'operator'), 'unfreeze': ('admin', 'operator'), 'assess': ('admin', 'engineer'), 'approve': ('admin', 'safety'), 'implement': ('admin', 'engineer'), 'commission': ('admin', 'engineer'), 'rollback': ('admin', 'engineer'), 'close': ('admin', 'safety'), 'complete': ('admin', 'engineer'), 'verify': ('admin', 'verifier'), 'reopen': ('admin', 'verifier'), 'submit': ('admin', 'engineer', 'operator'), 'confirm': ('admin', 'safety'), 'restore': ('admin', 'operator'), 'renew': ('admin', 'engineer')}
 
     def normalize_kind(self, kind):
         return self.ALIASES.get(kind, kind)
